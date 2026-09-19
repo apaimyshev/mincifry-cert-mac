@@ -1,0 +1,76 @@
+#!/bin/sh
+#
+# uninstall-mincifry — убрать доверие корню Минцифры из политики браузера.
+#
+#   sudo ./uninstall-mincifry                 Chrome (по умолчанию)
+#   sudo ./uninstall-mincifry --browser all   Chrome, Edge, Brave, Chromium
+#
+# Удаляется только ключ CACertificatesWithConstraints. Остальные политики
+# в файле не трогаются. Если после удаления в файле не остаётся ничего,
+# файл удаляется целиком.
+
+set -eu
+
+BROWSER=chrome
+KEY=":CACertificatesWithConstraints"
+PB=/usr/libexec/PlistBuddy
+MANAGED="${MINCIFRY_MANAGED_DIR:-/Library/Managed Preferences}"
+
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+usage() {
+	awk 'NR>2 && /^#/ { sub(/^# ?/, ""); print; next } NR>2 { exit }' "$0"
+	exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-h|--help) usage 0 ;;
+	--browser) shift; [ $# -gt 0 ] || die "--browser требует значение"; BROWSER="$1" ;;
+	*) die "Неизвестный аргумент: $1 (--help для справки)" ;;
+	esac
+	shift
+done
+
+case "$BROWSER" in
+chrome)   BUNDLES="com.google.Chrome" ;;
+edge)     BUNDLES="com.microsoft.Edge" ;;
+brave)    BUNDLES="com.brave.Browser" ;;
+chromium) BUNDLES="org.chromium.Chromium" ;;
+all)      BUNDLES="com.google.Chrome com.microsoft.Edge com.brave.Browser org.chromium.Chromium" ;;
+*) die "--browser принимает: chrome, edge, brave, chromium, all" ;;
+esac
+
+touched=0
+for bundle in $BUNDLES; do
+	PLIST="$MANAGED/$bundle.plist"
+	[ -f "$PLIST" ] || continue
+	"$PB" -c "Print $KEY" "$PLIST" >/dev/null 2>&1 || continue
+
+	[ -w "$PLIST" ] || die "Нет прав на запись в $PLIST. Запусти через sudo:
+  sudo $0 --browser $BROWSER"
+
+	"$PB" -c "Delete $KEY" "$PLIST"
+	say "Политика убрана: $bundle"
+	touched=$((touched + 1))
+
+	# Если файл опустел — он больше не нужен.
+	REST=$("$PB" -c "Print" "$PLIST" 2>/dev/null | sed -e '1d' -e '$d' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+	if [ "$REST" = 0 ]; then
+		rm -f "$PLIST"
+		say "  файл был пуст — удалён целиком"
+	else
+		say "  остальные политики в файле сохранены"
+	fi
+done
+
+if [ "$touched" = 0 ]; then
+	say "Нечего удалять: политика не найдена."
+	exit 0
+fi
+
+killall cfprefsd 2>/dev/null || true
+say ""
+say "Готово. Выйдите из браузера (⌘Q) и запустите заново."
+say "Резервные копии (*.backup-*) остались рядом — удалите вручную, если не нужны."

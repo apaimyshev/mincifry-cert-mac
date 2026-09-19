@@ -1,0 +1,134 @@
+#!/bin/sh
+#
+# add-mincifry — добавить домен в белый список корня Минцифры для Chrome.
+#
+# Chrome доверяет корню Russian Trusted Root CA только для доменов, перечисленных
+# в политике CACertificatesWithConstraints. Скрипт правит этот список.
+# Разбор, как всё устроено: /Library/Managed Preferences/com.google.Chrome.plist
+#
+#   sudo add-mincifry tbank.ru               добавить домен
+#   sudo add-mincifry tbank.ru ozonbank.ru   несколько сразу
+#        add-mincifry --list                 показать текущий список
+#   sudo add-mincifry --browser edge tbank.ru   то же самое для Edge
+#   sudo add-mincifry --remove tbank.ru      убрать домен
+#
+# Поддомены покрываются автоматически, отдельно их добавлять не нужно.
+
+set -eu
+
+MANAGED="${MINCIFRY_MANAGED_DIR:-/Library/Managed Preferences}"
+BUNDLE=com.google.Chrome
+case "${1:-}" in
+--browser)
+	shift
+	case "${1:-}" in
+	chrome)   BUNDLE=com.google.Chrome ;;
+	edge)     BUNDLE=com.microsoft.Edge ;;
+	brave)    BUNDLE=com.brave.Browser ;;
+	chromium) BUNDLE=org.chromium.Chromium ;;
+	*) printf 'Ошибка: --browser принимает chrome, edge, brave, chromium\n' >&2; exit 1 ;;
+	esac
+	shift
+	;;
+esac
+PLIST="${MINCIFRY_PLIST:-$MANAGED/$BUNDLE.plist}"
+
+case "$BUNDLE" in
+com.google.Chrome)     BROWSER_NAME=Chrome ;;
+com.microsoft.Edge)    BROWSER_NAME=Edge ;;
+com.brave.Browser)     BROWSER_NAME=Brave ;;
+org.chromium.Chromium) BROWSER_NAME=Chromium ;;
+*)                     BROWSER_NAME="браузер" ;;
+esac
+KEY=":CACertificatesWithConstraints:0:constraints:permitted_dns_names"
+PB=/usr/libexec/PlistBuddy
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage() {
+	awk 'NR>2 && /^#/ { sub(/^# ?/, ""); print; next } NR>2 { exit }' "$0"
+	exit "${1:-0}"
+}
+
+# Печатает текущий список по одному домену на строку.
+list_domains() {
+	"$PB" -c "Print $KEY" "$PLIST" 2>/dev/null \
+	| sed -e '1d' -e '$d' -e 's/^[[:space:]]*//' -e '/^$/d'
+}
+
+# Нормализует ввод: убирает схему, www, путь, порт, регистр.
+normalize() {
+	printf '%s' "$1" \
+	| tr '[:upper:]' '[:lower:]' \
+	| sed -e 's|^[a-z][a-z0-9+.-]*://||' -e 's|/.*$||' -e 's|:[0-9]*$||' -e 's|^www\.||'
+}
+
+need_write() {
+	[ -w "$PLIST" ] || die "Файл политики доступен только root. Запусти через sudo:
+  sudo $(basename "$0") $*"
+}
+
+reload_and_remind() {
+	killall cfprefsd 2>/dev/null || true
+	printf '\nТеперь ⌘Q в %s и запустить заново — без перезапуска политика не перечитается.\n' "$BROWSER_NAME"
+}
+
+[ $# -gt 0 ] || usage 1
+
+case "$1" in
+-h|--help)
+	usage 0
+	;;
+esac
+
+[ -f "$PLIST" ] || die "Политика не найдена: $PLIST
+Корень Минцифры ещё не настроен — сначала нужно развернуть политику целиком."
+
+case "$1" in
+-l|--list)
+	printf 'Домены, для которых %s доверяет корню Минцифры (%s):\n\n' "$BROWSER_NAME" "$(list_domains | wc -l | tr -d ' ')"
+	list_domains | sort | sed 's/^/  /'
+	exit 0
+	;;
+-r|--remove)
+	shift
+	[ $# -eq 1 ] || die "Укажи ровно один домен: add-mincifry --remove tbank.ru"
+	need_write --remove "$1"
+	domain=$(normalize "$1")
+	idx=$(list_domains | awk -v d="$domain" '$0==d {print NR-1; exit}')
+	[ -n "$idx" ] || die "Домена «${domain}» в списке нет. Текущий список: add-mincifry --list"
+	"$PB" -c "Delete $KEY:$idx" "$PLIST"
+	printf 'Убран: %s\n' "$domain"
+	reload_and_remind
+	exit 0
+	;;
+-*)
+	die "Неизвестный ключ: $1
+Запусти без аргументов, чтобы увидеть справку."
+	;;
+esac
+
+need_write "$@"
+
+added=0
+for raw in "$@"; do
+	domain=$(normalize "$raw")
+
+	printf '%s' "$domain" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
+		|| die "Не похоже на домен: «${raw}» (после разбора — «${domain}»)"
+
+	if list_domains | grep -qxF "$domain"; then
+		printf 'Уже в списке: %s\n' "$domain"
+		continue
+	fi
+
+	"$PB" -c "Add $KEY: string $domain" "$PLIST"
+	printf 'Добавлен: %s\n' "$domain"
+	added=$((added + 1))
+done
+
+if [ "$added" -gt 0 ]; then
+	reload_and_remind
+else
+	printf '\nНичего не изменилось.\n'
+fi

@@ -1,0 +1,45 @@
+# Домены, для которых браузер будет доверять корню Минцифры.
+# Одна запись на строку. Пустые строки и строки с # игнорируются.
+#
+# Пишите домен второго уровня, без схемы и без www: tbank.ru, а не https://www.tbank.ru/
+# Поддомены покрываются автоматически: запись sberbank.ru закрывает и online.sberbank.ru.
+#
+# Это список по умолчанию. Уберите лишнее, допишите своё — чем короче список,
+# тем меньше доверия вы выдаёте. Смысл всей затеи именно в этом.
+
+# --- Банки ---
+sberbank.ru
+sber.ru
+sberbank.com
+sbrf.ru
+vtb.ru
+vtb24.ru
+alfabank.ru
+alfabank.com
+tochka.com
+tochka.ru
+tbank.ru
+tinkoff.ru
+gazprombank.ru
+gpb.ru
+raiffeisen.ru
+rshb.ru
+psbank.ru
+psb.ru
+open.ru
+mkb.ru
+sovcombank.ru
+uralsib.ru
+rosbank.ru
+domrfbank.ru
+pochtabank.ru
+
+# --- Государство ---
+gosuslugi.ru
+nalog.gov.ru
+nalog.ru
+cbr.ru
+mos.ru
+sfr.gov.ru
+roskazna.ru
+gu-st.ru

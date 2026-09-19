@@ -1,0 +1,188 @@
+#!/bin/sh
+#
+# install-mincifry — включить доверие корню Минцифры в Chrome/Edge на macOS,
+# ограниченное белым списком доменов.
+#
+#   sudo ./install-mincifry                      список доменов из domains.txt рядом
+#   sudo ./install-mincifry --domains my.txt     свой список
+#   sudo ./install-mincifry --browser edge       только Edge (по умолчанию chrome)
+#   sudo ./install-mincifry --browser all        Chrome, Edge, Brave, Chromium
+#        ./install-mincifry --dry-run            показать, что будет сделано
+#
+# Скрипт НЕ добавляет корень в системное хранилище macOS и не трогает keychain.
+# Он правит политику браузера CACertificatesWithConstraints, поэтому доверие
+# действует только для перечисленных доменов и только в этом браузере.
+
+set -eu
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_DIR=$(dirname "$SELF_DIR")
+
+CERT="${MINCIFRY_CERT:-$REPO_DIR/certs/russian_trusted_root_ca.pem}"
+DOMAINS="${MINCIFRY_DOMAINS:-$REPO_DIR/domains.txt}"
+BROWSER=chrome
+DRY_RUN=no
+
+# Отпечаток корня Russian Trusted Root CA (выдан 01.03.2022, действует до 27.02.2032).
+# Сверяйте с тем, что публикуют Госуслуги: https://www.gosuslugi.ru/crt
+EXPECTED_SHA256="D26D2D0231B7C39F92CC738512BA54103519E4405D68B5BD703E9788CA8ECF31"
+
+KEY=":CACertificatesWithConstraints"
+PB=/usr/libexec/PlistBuddy
+MANAGED="${MINCIFRY_MANAGED_DIR:-/Library/Managed Preferences}"
+
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+run() { if [ "$DRY_RUN" = yes ]; then printf '  [dry-run] %s\n' "$*"; else eval "$@"; fi; }
+
+usage() {
+	awk 'NR>2 && /^#/ { sub(/^# ?/, ""); print; next } NR>2 { exit }' "$0"
+	exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-h|--help) usage 0 ;;
+	--dry-run) DRY_RUN=yes ;;
+	--cert) shift; [ $# -gt 0 ] || die "--cert требует путь"; CERT="$1" ;;
+	--domains) shift; [ $# -gt 0 ] || die "--domains требует путь"; DOMAINS="$1" ;;
+	--browser) shift; [ $# -gt 0 ] || die "--browser требует значение"; BROWSER="$1" ;;
+	*) die "Неизвестный аргумент: $1 (--help для справки)" ;;
+	esac
+	shift
+done
+
+case "$BROWSER" in
+chrome)   BUNDLES="com.google.Chrome" ;;
+edge)     BUNDLES="com.microsoft.Edge" ;;
+brave)    BUNDLES="com.brave.Browser" ;;
+chromium) BUNDLES="org.chromium.Chromium" ;;
+all)      BUNDLES="com.google.Chrome com.microsoft.Edge com.brave.Browser org.chromium.Chromium" ;;
+*) die "--browser принимает: chrome, edge, brave, chromium, all" ;;
+esac
+
+[ "$(uname -s)" = Darwin ] || die "Скрипт только для macOS. Для Windows см. README."
+[ -f "$CERT" ] || die "Сертификат не найден: $CERT"
+[ -f "$DOMAINS" ] || die "Список доменов не найден: $DOMAINS"
+[ -x "$PB" ] || die "Не найден PlistBuddy ($PB) — это стандартная утилита macOS."
+
+# --- 1. Сертификат: тот ли это корень ---
+
+say "1. Проверяю сертификат"
+FP=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//; s/://g' | tr 'a-f' 'A-F') \
+	|| die "Не удалось прочитать сертификат: $CERT"
+
+if [ "$FP" != "$EXPECTED_SHA256" ]; then
+	die "Отпечаток не совпал.
+  ожидается: $EXPECTED_SHA256
+  в файле:   $FP
+Это не тот корень, который ожидает скрипт. Не продолжаем."
+fi
+
+SUBJ=$(openssl x509 -in "$CERT" -noout -subject | sed 's/^subject=//')
+NOTAFTER=$(openssl x509 -in "$CERT" -noout -enddate | sed 's/^notAfter=//')
+say "   $SUBJ"
+say "   отпечаток совпал, действует до $NOTAFTER"
+
+openssl x509 -in "$CERT" -noout -checkend 0 >/dev/null 2>&1 || die "Сертификат просрочен."
+
+B64=$(openssl x509 -in "$CERT" -outform DER | base64 | tr -d '\n')
+
+# --- 2. Домены ---
+
+say ""
+say "2. Читаю список доменов: $DOMAINS"
+LIST=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$DOMAINS" | grep -v '^$' | sort -u)
+[ -n "$LIST" ] || die "Список доменов пуст. Нужен хотя бы один домен."
+
+for d in $LIST; do
+	printf '%s' "$d" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
+		|| die "Не похоже на домен: «${d}» (строка в $DOMAINS)"
+done
+COUNT=$(printf '%s\n' "$LIST" | wc -l | tr -d ' ')
+say "   доменов: $COUNT"
+
+# --- 3. Права и MDM ---
+
+say ""
+if [ "$DRY_RUN" = no ]; then
+	if [ -d "$MANAGED" ]; then
+		WRITE_TARGET="$MANAGED"
+	else
+		WRITE_TARGET=$(dirname "$MANAGED")
+	fi
+	[ -w "$WRITE_TARGET" ] || die "Нет прав на запись в $WRITE_TARGET. Запусти через sudo:
+  sudo $0 $*"
+fi
+
+if [ -d /var/db/ConfigurationProfiles/Store ] && \
+   profiles list -all >/dev/null 2>&1 && [ "$(profiles list -all 2>/dev/null | grep -c attribute)" -gt 0 ]; then
+	say "Внимание: на этом Mac есть профили MDM. Если политиками браузера управляет"
+	say "работодатель, ваш файл может быть перезаписан при следующей синхронизации."
+	say ""
+fi
+
+# --- 4. Установка ---
+
+say "3. Ставлю политику"
+run "mkdir -p \"$MANAGED\""
+
+for bundle in $BUNDLES; do
+	PLIST="$MANAGED/$bundle.plist"
+	say "   $bundle"
+
+	if [ -f "$PLIST" ]; then
+		BACKUP="$PLIST.backup-$(date +%Y%m%d-%H%M%S)"
+		# Два запуска в одну секунду не должны затирать первый бэкап.
+		n=1
+		while [ -e "$BACKUP" ]; do
+			BACKUP="$PLIST.backup-$(date +%Y%m%d-%H%M%S)-$n"
+			n=$((n + 1))
+		done
+		say "     файл уже есть — копия: $(basename "$BACKUP")"
+		run "cp \"$PLIST\" \"$BACKUP\""
+		# Сносим только свой ключ, остальные политики остаются нетронутыми.
+		if [ "$DRY_RUN" = no ] && "$PB" -c "Print $KEY" "$PLIST" >/dev/null 2>&1; then
+			"$PB" -c "Delete $KEY" "$PLIST"
+		fi
+	else
+		run "printf '%s' '<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict/></plist>' > \"$PLIST\""
+	fi
+
+	if [ "$DRY_RUN" = yes ]; then
+		printf '  [dry-run] записать корень Минцифры и домены (%s) в %s\n' "$COUNT" "$PLIST"
+		continue
+	fi
+
+	"$PB" -c "Add $KEY array" "$PLIST"
+	"$PB" -c "Add $KEY:0 dict" "$PLIST"
+	"$PB" -c "Add $KEY:0:certificate string $B64" "$PLIST"
+	"$PB" -c "Add $KEY:0:constraints dict" "$PLIST"
+	"$PB" -c "Add $KEY:0:constraints:permitted_dns_names array" "$PLIST"
+	for d in $LIST; do
+		"$PB" -c "Add $KEY:0:constraints:permitted_dns_names: string $d" "$PLIST"
+	done
+
+	[ "$(id -u)" -eq 0 ] && chown root:wheel "$PLIST"
+	chmod 644 "$PLIST"
+	plutil -lint "$PLIST" >/dev/null || die "Получился битый plist: $PLIST"
+	say "     готово, доменов: $COUNT"
+done
+
+if [ "$DRY_RUN" = yes ]; then
+	say ""
+	say "Это был dry-run, ничего не изменено."
+	exit 0
+fi
+
+killall cfprefsd 2>/dev/null || true
+
+say ""
+say "Готово. Что дальше:"
+say "  1. Полностью выйдите из браузера (⌘Q), затем запустите заново."
+say "  2. Откройте chrome://policy (или edge://policy) — там должна быть строка"
+say "     CACertificatesWithConstraints со статусом OK и источником Platform."
+say "  3. Откройте нужный сайт — предупреждение о сертификате должно исчезнуть."
+say ""
+say "Добавить домен потом:  sudo ./scripts/add-mincifry <домен>"
+say "Удалить всё:           sudo ./scripts/uninstall-mincifry"
